@@ -1,0 +1,23 @@
+# Virtual env & caches
+.venv/
+__pycache__/
+*.pyc
+
+# IDE & OS
+.agents/
+.claude/
+.DS_Store
+.vscode/
+.idea/
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Docs
+README.md

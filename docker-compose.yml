@@ -1,0 +1,17 @@
+services:
+  rag-chatbot:
+    build: .
+    container_name: rag-chatbot
+    ports:
+      - "8501:8501"
+    environment:
+      # Pass API keys as env vars (optional — app also accepts them via the UI)
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - HUGGINGFACE_API_KEY=${HUGGINGFACE_API_KEY:-}
+    volumes:
+      # Persist HuggingFace model cache across container restarts
+      - hf-cache:/root/.cache/huggingface
+    restart: unless-stopped
+
+volumes:
+  hf-cache:
