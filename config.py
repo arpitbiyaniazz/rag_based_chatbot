@@ -20,7 +20,7 @@ EMBEDDING_MODELS = {
 # ─────────────────────────────────────────────────────────────────────
 # LLM Providers & Models
 # ─────────────────────────────────────────────────────────────────────
-LLM_PROVIDERS = ["OpenAI", "HuggingFace Inference",]
+LLM_PROVIDERS = ["OpenAI", "HuggingFace Inference", "Mistral AI"]
 
 OPENAI_MODELS = [
     "gpt-4o-mini",
@@ -35,6 +35,15 @@ HF_MODELS = [
     "mistralai/Mistral-7B-Instruct-v0.3",
     "HuggingFaceH4/zephyr-7b-beta",
     "microsoft/Phi-3-mini-4k-instruct",
+]
+
+MISTRAL_MODELS = [
+    "mistral-large-latest",
+    "mistral-medium-latest",
+    "mistral-small-latest",
+    "open-mistral-nemo",
+    "codestral-latest",
+    "ministral-3b-2512",
 ]
 
 

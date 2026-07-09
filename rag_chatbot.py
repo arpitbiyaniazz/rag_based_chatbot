@@ -29,6 +29,7 @@ from config import (
     LLM_PROVIDERS,
     OPENAI_MODELS,
     HF_MODELS,
+    MISTRAL_MODELS,
     SEARCH_MODES,
 )
 from document_loader import load_document, chunk_text
@@ -148,12 +149,16 @@ def render_config_panel():
                 "🏢 LLM Provider",
                 LLM_PROVIDERS,
                 index=0,
-                help="Choose between OpenAI and HuggingFace Inference API.",
+                help="Choose between OpenAI, HuggingFace Inference, or Mistral AI.",
             )
             if llm_provider == "OpenAI":
                 model_list = OPENAI_MODELS
                 key_placeholder = "sk-..."
                 key_label = "🔑 OpenAI API Key"
+            elif llm_provider == "Mistral AI":
+                model_list = MISTRAL_MODELS
+                key_placeholder = "..."
+                key_label = "🔑 Mistral API Key"
             else:
                 model_list = HF_MODELS
                 key_placeholder = "hf_..."
@@ -381,6 +386,31 @@ def handle_question(config: dict, sidebar_config: dict):
 
             answer = result["answer"]
             sources = result["sources"]
+            query_eval = result.get("query_evaluation", {})
+
+            # ── Query evaluation feedback ───────────────────────────
+            if query_eval:
+                risk = query_eval.get("risk_level", "none")
+                was_modified = query_eval.get("was_modified", False)
+
+                if risk == "high" and not query_eval.get("is_safe", True):
+                    st.error(
+                        "🛡️ **Query blocked** — This query was identified as a "
+                        "prompt-injection attempt and was not processed."
+                    )
+                elif risk in ("medium", "low") and query_eval.get("flags"):
+                    flag_list = ", ".join(query_eval["flags"])
+                    st.warning(
+                        f"⚠️ **Security notice:** Potential issues detected "
+                        f"(risk: {risk}). {query_eval.get('explanation', '')}"
+                    )
+                if was_modified:
+                    st.info(
+                        f"✨ **Query refined:** Your question was cleaned up "
+                        f"for better results.\n\n"
+                        f"**Original:** {query_eval.get('original_query', question)}\n\n"
+                        f"**Used:** {query_eval.get('sanitized_query', question)}"
+                    )
 
             st.session_state.chat_history.append(
                 {"role": "assistant", "content": answer, "sources": sources}
@@ -415,6 +445,25 @@ def handle_question(config: dict, sidebar_config: dict):
                             f'</div>',
                             unsafe_allow_html=True,
                         )
+
+            # Query security details expander
+            if query_eval and query_eval.get("risk_level", "none") != "none":
+                with st.expander("🛡️ Query Security Details"):
+                    eval_col1, eval_col2 = st.columns(2)
+                    with eval_col1:
+                        risk_emoji = {"low": "🟡", "medium": "🟠", "high": "🔴"}.get(
+                            query_eval.get("risk_level", "none"), "⚪"
+                        )
+                        st.markdown(f"**Risk Level:** {risk_emoji} {query_eval.get('risk_level', 'none').title()}")
+                        st.markdown(f"**Safe:** {'✅ Yes' if query_eval.get('is_safe') else '❌ No'}")
+                    with eval_col2:
+                        st.markdown(f"**Modified:** {'Yes' if query_eval.get('was_modified') else 'No'}")
+                        if query_eval.get("explanation"):
+                            st.markdown(f"**Reason:** {query_eval['explanation']}")
+                    if query_eval.get("flags"):
+                        st.markdown("**Detected patterns:**")
+                        for flag in query_eval["flags"]:
+                            st.markdown(f"- `{flag}`")
 
         except Exception as exc:
             error_msg = f"Error generating answer: {exc}"

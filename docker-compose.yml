@@ -8,10 +8,11 @@ services:
       # Pass API keys as env vars (optional — app also accepts them via the UI)
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - HUGGINGFACE_API_KEY=${HUGGINGFACE_API_KEY:-}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY:-}
     volumes:
       # Persist HuggingFace model cache across container restarts
-      - hf-cache:/root/.cache/huggingface
+      - mistral-cache:/root/.cache/mistralai
     restart: unless-stopped
 
 volumes:
-  hf-cache:
+  mistral-cache:

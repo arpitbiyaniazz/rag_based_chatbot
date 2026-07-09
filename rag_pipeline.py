@@ -8,7 +8,8 @@ from typing import List, Optional
 from langchain_community.vectorstores import FAISS
 
 from web_search import web_search_duckduckgo, format_web_results_as_context
-from llm import query_openai, query_huggingface
+from llm import query_openai, query_huggingface, query_mistral
+from query_evaluator import evaluate_query
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -57,18 +58,51 @@ def ask_question(
     temperature: float = 0.3,
     max_tokens: int = 1024,
 ) -> dict:
-    """Full RAG pipeline: retrieve → (web search) → prompt → generate."""
+    """Full RAG pipeline: evaluate → retrieve → (web search) → prompt → generate."""
 
     context_chunks = []
     sources = []
     web_results = []
+
+    # 0. Query evaluation — prompt-injection detection & refinement
+    query_eval = evaluate_query(
+        query=question,
+        llm_provider=llm_provider,
+        llm_model=llm_model,
+        api_key=api_key,
+    )
+
+    # Block high-risk injection attempts outright
+    if not query_eval.is_safe and query_eval.risk_level == "high":
+        return {
+            "answer": (
+                "⚠️ **Your query was flagged as a potential prompt-injection attempt "
+                "and has been blocked.**\n\n"
+                f"**Reason:** {query_eval.explanation}\n\n"
+                "Please rephrase your question to focus on your document or topic."
+            ),
+            "sources": [],
+            "context": [],
+            "web_results": [],
+            "query_evaluation": {
+                "original_query": query_eval.original_query,
+                "risk_level": query_eval.risk_level,
+                "flags": query_eval.flags,
+                "is_safe": query_eval.is_safe,
+                "was_modified": query_eval.was_modified,
+                "explanation": query_eval.explanation,
+            },
+        }
+
+    # Use the sanitized / refined query for downstream processing
+    safe_question = query_eval.sanitized_query
 
     use_docs = "Documents" in search_mode or "📄" in search_mode
     use_web = "Web" in search_mode or "🌐" in search_mode
 
     # 1. Document retrieval
     if use_docs and vector_store is not None:
-        results = vector_store.similarity_search_with_score(question, k=top_k)
+        results = vector_store.similarity_search_with_score(safe_question, k=top_k)
         context_chunks = [doc.page_content for doc, _score in results]
         sources = [
             {
@@ -82,7 +116,7 @@ def ask_question(
     # 2. Web search
     web_chunks = []
     if use_web:
-        web_results = web_search_duckduckgo(question, max_results=web_results_count)
+        web_results = web_search_duckduckgo(safe_question, max_results=web_results_count)
         web_chunks = format_web_results_as_context(web_results)
         for r in web_results:
             sources.append({
@@ -99,11 +133,13 @@ def ask_question(
         "Be concise and accurate."
     )
 
-    prompt = build_rag_prompt(question, context_chunks, web_chunks if use_web else None)
+    prompt = build_rag_prompt(safe_question, context_chunks, web_chunks if use_web else None)
 
     # 4. Generate answer
     if llm_provider == "OpenAI":
         answer = query_openai(prompt, llm_model, api_key, system_prompt, temperature, max_tokens)
+    elif llm_provider == "Mistral AI":
+        answer = query_mistral(prompt, llm_model, api_key, system_prompt, temperature, max_tokens)
     else:
         answer = query_huggingface(prompt, llm_model, api_key, system_prompt, temperature, max_tokens)
 
@@ -112,4 +148,14 @@ def ask_question(
         "sources": sources,
         "context": context_chunks,
         "web_results": web_results,
+        "query_evaluation": {
+            "original_query": query_eval.original_query,
+            "sanitized_query": query_eval.sanitized_query,
+            "risk_level": query_eval.risk_level,
+            "flags": query_eval.flags,
+            "is_safe": query_eval.is_safe,
+            "was_modified": query_eval.was_modified,
+            "explanation": query_eval.explanation,
+        },
     }
+
