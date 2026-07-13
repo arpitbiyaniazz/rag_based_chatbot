@@ -10,6 +10,7 @@ from langchain_community.vectorstores import FAISS
 from web_search import web_search_duckduckgo, format_web_results_as_context
 from llm import query_openai, query_huggingface, query_mistral
 from query_evaluator import evaluate_query
+from retrieval_evaluator import evaluate_and_retry_retrieval
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -58,11 +59,12 @@ def ask_question(
     temperature: float = 0.3,
     max_tokens: int = 1024,
 ) -> dict:
-    """Full RAG pipeline: evaluate → retrieve → (web search) → prompt → generate."""
+    """Full RAG pipeline: evaluate → retrieve (with retry) → (web search) → prompt → generate."""
 
     context_chunks = []
     sources = []
     web_results = []
+    retrieval_eval_info = {}
 
     # 0. Query evaluation — prompt-injection detection & refinement
     query_eval = evaluate_query(
@@ -92,6 +94,7 @@ def ask_question(
                 "was_modified": query_eval.was_modified,
                 "explanation": query_eval.explanation,
             },
+            "retrieval_evaluation": {},
         }
 
     # Use the sanitized / refined query for downstream processing
@@ -100,18 +103,61 @@ def ask_question(
     use_docs = "Documents" in search_mode or "📄" in search_mode
     use_web = "Web" in search_mode or "🌐" in search_mode
 
-    # 1. Document retrieval
+    # 1. Document retrieval with relevance evaluation & retry
     if use_docs and vector_store is not None:
-        results = vector_store.similarity_search_with_score(safe_question, k=top_k)
-        context_chunks = [doc.page_content for doc, _score in results]
-        sources = [
-            {
-                "source": doc.metadata.get("source", "unknown"),
-                "score": round(float(score), 4),
-                "type": "document",
-            }
-            for doc, score in results
-        ]
+        retrieval_result = evaluate_and_retry_retrieval(
+            question=safe_question,
+            vector_store=vector_store,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            api_key=api_key,
+            top_k=top_k,
+        )
+
+        retrieval_eval_info = {
+            "is_relevant": retrieval_result.is_relevant,
+            "attempts_made": retrieval_result.attempts_made,
+            "attempt_log": retrieval_result.attempt_log,
+            "chunks_before_ranking": retrieval_result.chunks_before_ranking,
+            "chunks_after_ranking": retrieval_result.chunks_after_ranking,
+        }
+
+        if retrieval_result.is_relevant:
+            context_chunks = retrieval_result.context_chunks
+            sources = retrieval_result.sources
+        else:
+            # All 3 retrieval attempts failed — documents can't answer
+            # If web search is also not enabled, return "I don't know"
+            if not use_web:
+                return {
+                    "answer": (
+                        "🤷 **I don't know.**\n\n"
+                        "I retrieved documents from your knowledge base "
+                        f"across **{retrieval_result.attempts_made} attempts** "
+                        "with different search strategies, but none of the "
+                        "retrieved content was relevant enough to answer "
+                        "your question.\n\n"
+                        "**Suggestions:**\n"
+                        "- Try rephrasing your question\n"
+                        "- Upload additional documents that cover this topic\n"
+                        "- Switch to a search mode that includes Web Search"
+                    ),
+                    "sources": [],
+                    "context": [],
+                    "web_results": [],
+                    "query_evaluation": {
+                        "original_query": query_eval.original_query,
+                        "sanitized_query": query_eval.sanitized_query,
+                        "risk_level": query_eval.risk_level,
+                        "flags": query_eval.flags,
+                        "is_safe": query_eval.is_safe,
+                        "was_modified": query_eval.was_modified,
+                        "explanation": query_eval.explanation,
+                    },
+                    "retrieval_evaluation": retrieval_eval_info,
+                }
+            # If web search IS enabled, continue without doc context
+            # (web results may still answer the question)
 
     # 2. Web search
     web_chunks = []
@@ -124,6 +170,30 @@ def ask_question(
                 "url": r["url"],
                 "type": "web",
             })
+
+    # If no context at all (no docs and no web results), return "I don't know"
+    if not context_chunks and not web_chunks:
+        return {
+            "answer": (
+                "🤷 **I don't know.**\n\n"
+                "No relevant context was found from either documents or web search "
+                "to answer your question. Please try rephrasing or uploading "
+                "relevant documents."
+            ),
+            "sources": [],
+            "context": [],
+            "web_results": [],
+            "query_evaluation": {
+                "original_query": query_eval.original_query,
+                "sanitized_query": query_eval.sanitized_query,
+                "risk_level": query_eval.risk_level,
+                "flags": query_eval.flags,
+                "is_safe": query_eval.is_safe,
+                "was_modified": query_eval.was_modified,
+                "explanation": query_eval.explanation,
+            },
+            "retrieval_evaluation": retrieval_eval_info,
+        }
 
     # 3. Build prompt
     system_prompt = (
@@ -157,5 +227,6 @@ def ask_question(
             "was_modified": query_eval.was_modified,
             "explanation": query_eval.explanation,
         },
+        "retrieval_evaluation": retrieval_eval_info,
     }
 

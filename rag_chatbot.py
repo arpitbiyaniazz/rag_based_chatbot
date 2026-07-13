@@ -56,6 +56,10 @@ def init_session_state():
         "chunk_count": 0,
         "api_key_input": "",
         "config_saved": False,
+        # Per-document cache: {hash: {"name": str, "chunks": [...], "metas": [...]}}
+        "doc_store": {},
+        # Track the set of hashes from the last uploader state
+        "last_upload_hashes": set(),
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -120,6 +124,8 @@ def render_sidebar():
         if st.button("🗑️ Clear Knowledge Base", use_container_width=True):
             st.session_state.vector_store = None
             st.session_state.processed_hashes = set()
+            st.session_state.doc_store = {}
+            st.session_state.last_upload_hashes = set()
             st.session_state.doc_count = 0
             st.session_state.chunk_count = 0
             st.rerun()
@@ -242,8 +248,41 @@ def render_config_panel():
     }
 
 
+def _rebuild_vector_store_from_cache(emb_model_id: str):
+    """Rebuild the FAISS vector store from all cached document chunks."""
+    doc_store = st.session_state.doc_store
+
+    if not doc_store:
+        st.session_state.vector_store = None
+        st.session_state.doc_count = 0
+        st.session_state.chunk_count = 0
+        return
+
+    all_chunks: List[str] = []
+    all_metas: List[dict] = []
+
+    for doc_data in doc_store.values():
+        all_chunks.extend(doc_data["chunks"])
+        all_metas.extend(doc_data["metas"])
+
+    if all_chunks:
+        embeddings = get_embedding_model(emb_model_id)
+        st.session_state.vector_store = build_vector_store(all_chunks, all_metas, embeddings)
+    else:
+        st.session_state.vector_store = None
+
+    st.session_state.doc_count = len(doc_store)
+    st.session_state.chunk_count = len(all_chunks)
+
+
 def handle_file_upload(emb_model_id: str, chunk_size: int, chunk_overlap: int):
-    """Handle document upload, parsing, chunking, and indexing."""
+    """
+    Handle document upload with incremental processing.
+
+    - Only genuinely new files are chunked and embedded.
+    - Removed files' chunks are dropped and the index is rebuilt from cache.
+    - Previously processed files are never re-processed.
+    """
     uploaded_files = st.file_uploader(
         "Upload Documents",
         type=["pdf", "txt", "docx"],
@@ -251,71 +290,114 @@ def handle_file_upload(emb_model_id: str, chunk_size: int, chunk_overlap: int):
         help="Drag & drop PDF, TXT, or DOCX files here.",
     )
 
-    if not uploaded_files:
+    # Compute the current set of file hashes from the uploader
+    current_hashes: dict[str, bytes] = {}  # hash → raw bytes
+    current_names: dict[str, str] = {}     # hash → filename
+    if uploaded_files:
+        for f in uploaded_files:
+            raw = f.getvalue()
+            h = file_content_hash(raw)
+            current_hashes[h] = raw
+            current_names[h] = f.name
+
+    current_hash_set = set(current_hashes.keys())
+    cached_hash_set = set(st.session_state.doc_store.keys())
+
+    # Detect additions and removals
+    added_hashes = current_hash_set - cached_hash_set
+    removed_hashes = cached_hash_set - current_hash_set
+
+    # Nothing changed — skip
+    if not added_hashes and not removed_hashes:
         return
 
-    new_files = [
-        f
-        for f in uploaded_files
-        if file_content_hash(f.getvalue()) not in st.session_state.processed_hashes
-    ]
+    # ── Handle removals ─────────────────────────────────────────────
+    if removed_hashes:
+        removed_names = [
+            st.session_state.doc_store[h]["name"]
+            for h in removed_hashes
+            if h in st.session_state.doc_store
+        ]
+        for h in removed_hashes:
+            st.session_state.doc_store.pop(h, None)
+            st.session_state.processed_hashes.discard(h)
 
-    if not new_files:
-        return
+        # Rebuild the vector store from remaining cached docs
+        with st.status(f"Removing {len(removed_names)} document(s) …", expanded=True) as status:
+            for name in removed_names:
+                st.write(f"🗑️ Removing **{name}** …")
+            _rebuild_vector_store_from_cache(emb_model_id)
+            status.update(label=f"✅ Removed {len(removed_names)} document(s).", state="complete")
 
-    with st.status(f"Processing {len(new_files)} new document(s) …", expanded=True) as status:
-        all_chunks: List[str] = []
-        all_metas: List[dict] = []
+    # ── Handle additions ────────────────────────────────────────────
+    if added_hashes:
+        with st.status(f"Processing {len(added_hashes)} new document(s) …", expanded=True) as status:
+            new_chunks_total: List[str] = []
+            new_metas_total: List[dict] = []
+            embeddings = get_embedding_model(emb_model_id)
 
-        embeddings = get_embedding_model(emb_model_id)
+            for h in added_hashes:
+                name = current_names[h]
+                raw_bytes = current_hashes[h]
+                ext = os.path.splitext(name)[1].lower()
 
-        for uf in new_files:
-            st.write(f"📄 Parsing **{uf.name}** …")
-            ext = os.path.splitext(uf.name)[1].lower()
+                st.write(f"📄 Parsing **{name}** …")
 
-            if ext not in SUPPORTED_EXTENSIONS:
-                st.warning(f"Skipped unsupported file: {uf.name}")
-                continue
+                if ext not in SUPPORTED_EXTENSIONS:
+                    st.warning(f"Skipped unsupported file: {name}")
+                    continue
 
-            try:
-                with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                    tmp.write(uf.getvalue())
-                    tmp_path = tmp.name
-                text = load_document(tmp_path, ext)
-            except Exception as exc:
-                st.error(f"Error reading **{uf.name}**: {exc}")
-                continue
-            finally:
-                if "tmp_path" in locals() and os.path.exists(tmp_path):
-                    os.unlink(tmp_path)
+                try:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                        tmp.write(raw_bytes)
+                        tmp_path = tmp.name
+                    text = load_document(tmp_path, ext)
+                except Exception as exc:
+                    st.error(f"Error reading **{name}**: {exc}")
+                    continue
+                finally:
+                    if "tmp_path" in locals() and os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
 
-            if not text.strip():
-                st.warning(f"No extractable text in **{uf.name}** — skipping.")
-                continue
+                if not text.strip():
+                    st.warning(f"No extractable text in **{name}** — skipping.")
+                    continue
 
-            st.write(f"✂️ Chunking **{uf.name}** (chunk_size={chunk_size}) …")
-            chunks = chunk_text(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-            metas = [{"source": uf.name, "chunk_index": i} for i in range(len(chunks))]
+                st.write(f"✂️ Chunking **{name}** (chunk_size={chunk_size}) …")
+                chunks = chunk_text(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+                metas = [{"source": name, "chunk_index": i} for i in range(len(chunks))]
 
-            all_chunks.extend(chunks)
-            all_metas.extend(metas)
+                # Cache per-document chunks
+                st.session_state.doc_store[h] = {
+                    "name": name,
+                    "chunks": chunks,
+                    "metas": metas,
+                }
+                st.session_state.processed_hashes.add(h)
 
-            st.session_state.processed_hashes.add(file_content_hash(uf.getvalue()))
-            st.session_state.doc_count += 1
+                new_chunks_total.extend(chunks)
+                new_metas_total.extend(metas)
 
-        if all_chunks:
-            st.write(f"🧠 Embedding {len(all_chunks)} chunks …")
-            new_store = build_vector_store(all_chunks, all_metas, embeddings)
+            if new_chunks_total:
+                st.write(f"🧠 Embedding {len(new_chunks_total)} new chunks …")
+                new_store = build_vector_store(new_chunks_total, new_metas_total, embeddings)
 
-            if st.session_state.vector_store is not None:
-                st.session_state.vector_store.merge_from(new_store)
+                if st.session_state.vector_store is not None:
+                    st.session_state.vector_store.merge_from(new_store)
+                else:
+                    st.session_state.vector_store = new_store
+
+                # Update counts from cache (always accurate)
+                st.session_state.doc_count = len(st.session_state.doc_store)
+                st.session_state.chunk_count = sum(
+                    len(d["chunks"]) for d in st.session_state.doc_store.values()
+                )
+                status.update(label="✅ Documents processed!", state="complete")
             else:
-                st.session_state.vector_store = new_store
+                status.update(label="⚠️ No text extracted.", state="error")
 
-            st.session_state.chunk_count += len(all_chunks)
-            status.update(label="✅ Documents processed!", state="complete")
-        else:
-            status.update(label="⚠️ No text extracted.", state="error")
+    # Update the last-known upload hashes
+    st.session_state.last_upload_hashes = current_hash_set
 
 
 def render_chat_history():
@@ -464,6 +546,50 @@ def handle_question(config: dict, sidebar_config: dict):
                         st.markdown("**Detected patterns:**")
                         for flag in query_eval["flags"]:
                             st.markdown(f"- `{flag}`")
+
+            # Retrieval evaluation details
+            retrieval_eval = result.get("retrieval_evaluation", {})
+            if retrieval_eval:
+                attempts = retrieval_eval.get("attempts_made", 0)
+                is_relevant = retrieval_eval.get("is_relevant", True)
+                attempt_log = retrieval_eval.get("attempt_log", [])
+                before = retrieval_eval.get("chunks_before_ranking", 0)
+                after = retrieval_eval.get("chunks_after_ranking", 0)
+
+                if not is_relevant:
+                    st.warning(
+                        f"📊 **Retrieval failed** — Tried {attempts} retrieval "
+                        f"strategies but could not find relevant documents."
+                    )
+                elif attempts > 1:
+                    st.info(
+                        f"🔄 **Retrieval refined** — Found relevant context on "
+                        f"attempt {attempts} of 3."
+                    )
+
+                if before > 0 and after > 0 and before != after:
+                    st.info(
+                        f"🏆 **Chunk ranking** — Retrieved {before} chunks, "
+                        f"selected the top {after} most relevant for context."
+                    )
+
+                if attempt_log:
+                    with st.expander("📊 Retrieval Evaluation Details"):
+                        for entry in attempt_log:
+                            status = "✅" if entry.get("is_relevant") else "❌"
+                            st.markdown(
+                                f"**Attempt {entry.get('attempt', '?')}** — "
+                                f"{entry.get('strategy', 'unknown')} → "
+                                f"{status} {entry.get('chunks_retrieved', 0)} chunks"
+                            )
+                            if entry.get("reason"):
+                                st.caption(f"  ↳ {entry['reason']}")
+                        if before > 0 and after > 0:
+                            st.divider()
+                            st.markdown(
+                                f"**Ranking:** {before} retrieved → "
+                                f"**{after} selected** (top by relevance)"
+                            )
 
         except Exception as exc:
             error_msg = f"Error generating answer: {exc}"
