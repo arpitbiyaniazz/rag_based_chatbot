@@ -4,8 +4,6 @@ __pycache__/
 *.pyc
 
 # IDE & OS
-.agents/
-.claude/
 .DS_Store
 .vscode/
 .idea/

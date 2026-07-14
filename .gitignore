@@ -7,10 +7,6 @@ __pycache__/
 *.pyo
 *.egg-info/
 
-# Environment variables
-.env
-.agents
-.claude
 
 # OS
 .DS_Store
