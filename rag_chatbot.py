@@ -24,7 +24,6 @@ import streamlit as st
 
 # ── Internal modules ────────────────────────────────────────────────
 from config import (
-    SUPPORTED_EXTENSIONS,
     EMBEDDING_MODELS,
     LLM_PROVIDERS,
     OPENAI_MODELS,
@@ -58,31 +57,13 @@ def init_session_state():
         "config_saved": False,
         # Per-document cache: {hash: {"name": str, "chunks": [...], "metas": [...]}}
         "doc_store": {},
-        # Track the set of hashes from the last uploader state
-        "last_upload_hashes": set(),
+        "current_file_config": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
 
 
-def render_source_pills(sources: list) -> str:
-    """Build HTML source pills from a list of source dicts."""
-    pills = []
-    for s in sources:
-        if s.get("type") == "web":
-            url = s.get("url", "#")
-            pills.append(
-                f'<span class="source-pill-web">'
-                f'🌐 <a href="{url}" target="_blank">{s["source"]}</a>'
-                f'</span>'
-            )
-        else:
-            score_str = f' (score: {s["score"]})' if "score" in s else ""
-            pills.append(
-                f'<span class="source-pill">📄 {s["source"]}{score_str}</span>'
-            )
-    return " ".join(pills)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -98,14 +79,6 @@ def render_sidebar():
 
         st.divider()
 
-        chunk_size = st.slider("Chunk Size", 200, 2000, 800, step=100)
-        chunk_overlap = st.slider("Chunk Overlap", 0, 500, 200, step=50)
-        top_k = st.slider("Top-K Retrieved Chunks", 1, 10, 4)
-        web_results_count = st.slider("Web Results Count", 1, 10, 5)
-        temperature = st.slider("Temperature", 0.0, 1.0, 0.3, step=0.05)
-        max_tokens = st.slider("Max Output Tokens", 128, 4096, 1024, step=128)
-
-        st.divider()
 
         # Stats
         st.markdown("### 📊 Knowledge Base")
@@ -125,7 +98,6 @@ def render_sidebar():
             st.session_state.vector_store = None
             st.session_state.processed_hashes = set()
             st.session_state.doc_store = {}
-            st.session_state.last_upload_hashes = set()
             st.session_state.doc_count = 0
             st.session_state.chunk_count = 0
             st.rerun()
@@ -136,12 +108,12 @@ def render_sidebar():
 
     return {
         "emb_model_id": emb_model_id,
-        "chunk_size": chunk_size,
-        "chunk_overlap": chunk_overlap,
-        "top_k": top_k,
-        "web_results_count": web_results_count,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
+        "chunk_size": 800,
+        "chunk_overlap": 200,
+        "top_k": 4,
+        "web_results_count": 5,
+        "temperature": 0.3,
+        "max_tokens": 1024,
     }
 
 
@@ -248,156 +220,91 @@ def render_config_panel():
     }
 
 
-def _rebuild_vector_store_from_cache(emb_model_id: str):
-    """Rebuild the FAISS vector store from all cached document chunks."""
-    doc_store = st.session_state.doc_store
-
-    if not doc_store:
-        st.session_state.vector_store = None
-        st.session_state.doc_count = 0
-        st.session_state.chunk_count = 0
-        return
-
-    all_chunks: List[str] = []
-    all_metas: List[dict] = []
-
-    for doc_data in doc_store.values():
-        all_chunks.extend(doc_data["chunks"])
-        all_metas.extend(doc_data["metas"])
-
-    if all_chunks:
-        embeddings = get_embedding_model(emb_model_id)
-        st.session_state.vector_store = build_vector_store(all_chunks, all_metas, embeddings)
-    else:
-        st.session_state.vector_store = None
-
-    st.session_state.doc_count = len(doc_store)
-    st.session_state.chunk_count = len(all_chunks)
-
-
 def handle_file_upload(emb_model_id: str, chunk_size: int, chunk_overlap: int):
     """
-    Handle document upload with incremental processing.
-
-    - Only genuinely new files are chunked and embedded.
-    - Removed files' chunks are dropped and the index is rebuilt from cache.
-    - Previously processed files are never re-processed.
+    Handle uploading a single document of any type.
+    Whenever a new file is uploaded, a new chunking is created, replacing the previous one.
     """
-    uploaded_files = st.file_uploader(
-        "Upload Documents",
-        type=["pdf", "txt", "docx"],
-        accept_multiple_files=True,
-        help="Drag & drop PDF, TXT, or DOCX files here.",
+    uploaded_file = st.file_uploader(
+        "Upload Document",
+        type=None,  # supports any file type
+        accept_multiple_files=False,
+        help="Upload any file to chat with its contents.",
     )
 
-    # Compute the current set of file hashes from the uploader
-    current_hashes: dict[str, bytes] = {}  # hash → raw bytes
-    current_names: dict[str, str] = {}     # hash → filename
-    if uploaded_files:
-        for f in uploaded_files:
-            raw = f.getvalue()
-            h = file_content_hash(raw)
-            current_hashes[h] = raw
-            current_names[h] = f.name
-
-    current_hash_set = set(current_hashes.keys())
-    cached_hash_set = set(st.session_state.doc_store.keys())
-
-    # Detect additions and removals
-    added_hashes = current_hash_set - cached_hash_set
-    removed_hashes = cached_hash_set - current_hash_set
-
-    # Nothing changed — skip
-    if not added_hashes and not removed_hashes:
+    if not uploaded_file:
+        # If no file is uploaded, clear the vector store and stats
+        if st.session_state.vector_store is not None:
+            st.session_state.vector_store = None
+            st.session_state.processed_hashes = set()
+            st.session_state.doc_store = {}
+            st.session_state.doc_count = 0
+            st.session_state.chunk_count = 0
         return
 
-    # ── Handle removals ─────────────────────────────────────────────
-    if removed_hashes:
-        removed_names = [
-            st.session_state.doc_store[h]["name"]
-            for h in removed_hashes
-            if h in st.session_state.doc_store
-        ]
-        for h in removed_hashes:
-            st.session_state.doc_store.pop(h, None)
-            st.session_state.processed_hashes.discard(h)
+    # Calculate hash of the uploaded file
+    file_bytes = uploaded_file.getvalue()
+    h = file_content_hash(file_bytes)
 
-        # Rebuild the vector store from remaining cached docs
-        with st.status(f"Removing {len(removed_names)} document(s) …", expanded=True) as status:
-            for name in removed_names:
-                st.write(f"🗑️ Removing **{name}** …")
-            _rebuild_vector_store_from_cache(emb_model_id)
-            status.update(label=f"✅ Removed {len(removed_names)} document(s).", state="complete")
+    # Check if this file has already been processed with the exact current embedding & chunk configuration
+    current_config = (h, emb_model_id, chunk_size, chunk_overlap)
+    if st.session_state.get("current_file_config") == current_config:
+        return
 
-    # ── Handle additions ────────────────────────────────────────────
-    if added_hashes:
-        with st.status(f"Processing {len(added_hashes)} new document(s) …", expanded=True) as status:
-            new_chunks_total: List[str] = []
-            new_metas_total: List[dict] = []
-            embeddings = get_embedding_model(emb_model_id)
+    # A new file or a different embedding/chunking configuration has been loaded.
+    # Completely reset and clear all old databases and session properties.
+    st.session_state.vector_store = None
+    st.session_state.processed_hashes = set()
+    st.session_state.doc_store = {}
+    st.session_state.doc_count = 0
+    st.session_state.chunk_count = 0
+    st.session_state.current_file_config = None
 
-            for h in added_hashes:
-                name = current_names[h]
-                raw_bytes = current_hashes[h]
-                ext = os.path.splitext(name)[1].lower()
+    with st.status("Processing uploaded document …", expanded=True) as status:
+        name = uploaded_file.name
+        ext = os.path.splitext(name)[1].lower()
 
-                st.write(f"📄 Parsing **{name}** …")
+        st.write(f"📄 Parsing **{name}** …")
 
-                if ext not in SUPPORTED_EXTENSIONS:
-                    st.warning(f"Skipped unsupported file: {name}")
-                    continue
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
+            text = load_document(tmp_path, ext)
+        except Exception as exc:
+            st.error(f"Error reading **{name}**: {exc}")
+            status.update(label="❌ Failed to parse document.", state="error")
+            return
+        finally:
+            if "tmp_path" in locals() and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
-                try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-                        tmp.write(raw_bytes)
-                        tmp_path = tmp.name
-                    text = load_document(tmp_path, ext)
-                except Exception as exc:
-                    st.error(f"Error reading **{name}**: {exc}")
-                    continue
-                finally:
-                    if "tmp_path" in locals() and os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
+        if not text.strip():
+            st.warning(f"No extractable text in **{name}**.")
+            status.update(label="⚠️ Empty document.", state="error")
+            return
 
-                if not text.strip():
-                    st.warning(f"No extractable text in **{name}** — skipping.")
-                    continue
+        st.write(f"✂️ Creating new chunking (chunk_size={chunk_size}) …")
+        chunks = chunk_text(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+        metas = [{"source": name, "chunk_index": i} for i in range(len(chunks))]
 
-                st.write(f"✂️ Chunking **{name}** (chunk_size={chunk_size}) …")
-                chunks = chunk_text(text, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-                metas = [{"source": name, "chunk_index": i} for i in range(len(chunks))]
+        st.write(f"🧠 Generating embeddings for {len(chunks)} chunks …")
+        embeddings = get_embedding_model(emb_model_id)
+        st.session_state.vector_store = build_vector_store(chunks, metas, embeddings)
 
-                # Cache per-document chunks
-                st.session_state.doc_store[h] = {
-                    "name": name,
-                    "chunks": chunks,
-                    "metas": metas,
-                }
-                st.session_state.processed_hashes.add(h)
+        # Cache in doc_store and update session state
+        st.session_state.doc_store[h] = {
+            "name": name,
+            "chunks": chunks,
+            "metas": metas,
+        }
+        st.session_state.processed_hashes.add(h)
+        st.session_state.doc_count = 1
+        st.session_state.chunk_count = len(chunks)
+        st.session_state.current_file_config = current_config
 
-                new_chunks_total.extend(chunks)
-                new_metas_total.extend(metas)
+        status.update(label="✅ Document successfully chunked and indexed!", state="complete")
 
-            if new_chunks_total:
-                st.write(f"🧠 Embedding {len(new_chunks_total)} new chunks …")
-                new_store = build_vector_store(new_chunks_total, new_metas_total, embeddings)
-
-                if st.session_state.vector_store is not None:
-                    st.session_state.vector_store.merge_from(new_store)
-                else:
-                    st.session_state.vector_store = new_store
-
-                # Update counts from cache (always accurate)
-                st.session_state.doc_count = len(st.session_state.doc_store)
-                st.session_state.chunk_count = sum(
-                    len(d["chunks"]) for d in st.session_state.doc_store.values()
-                )
-                status.update(label="✅ Documents processed!", state="complete")
-            else:
-                status.update(label="⚠️ No text extracted.", state="error")
-
-    # Update the last-known upload hashes
-    st.session_state.last_upload_hashes = current_hash_set
 
 
 def render_chat_history():
@@ -413,9 +320,7 @@ def render_chat_history():
                 f'<div class="chat-assistant">🤖 {msg["content"]}</div>',
                 unsafe_allow_html=True,
             )
-            if msg.get("sources"):
-                pills_html = render_source_pills(msg["sources"])
-                st.markdown(f"**Sources:** {pills_html}", unsafe_allow_html=True)
+
 
 
 def handle_question(config: dict, sidebar_config: dict):
@@ -471,28 +376,13 @@ def handle_question(config: dict, sidebar_config: dict):
             query_eval = result.get("query_evaluation", {})
 
             # ── Query evaluation feedback ───────────────────────────
-            if query_eval:
-                risk = query_eval.get("risk_level", "none")
-                was_modified = query_eval.get("was_modified", False)
-
-                if risk == "high" and not query_eval.get("is_safe", True):
-                    st.error(
-                        "🛡️ **Query blocked** — This query was identified as a "
-                        "prompt-injection attempt and was not processed."
-                    )
-                elif risk in ("medium", "low") and query_eval.get("flags"):
-                    flag_list = ", ".join(query_eval["flags"])
-                    st.warning(
-                        f"⚠️ **Security notice:** Potential issues detected "
-                        f"(risk: {risk}). {query_eval.get('explanation', '')}"
-                    )
-                if was_modified:
-                    st.info(
-                        f"✨ **Query refined:** Your question was cleaned up "
-                        f"for better results.\n\n"
-                        f"**Original:** {query_eval.get('original_query', question)}\n\n"
-                        f"**Used:** {query_eval.get('sanitized_query', question)}"
-                    )
+            if query_eval and query_eval.get("was_modified", False):
+                st.info(
+                    f"✨ **Query refined:** Your question was cleaned up "
+                    f"for better results.\n\n"
+                    f"**Original:** {query_eval.get('original_query', question)}\n\n"
+                    f"**Used:** {query_eval.get('sanitized_query', question)}"
+                )
 
             st.session_state.chat_history.append(
                 {"role": "assistant", "content": answer, "sources": sources}
@@ -503,10 +393,7 @@ def handle_question(config: dict, sidebar_config: dict):
                 unsafe_allow_html=True,
             )
 
-            # Source pills
-            if sources:
-                pills_html = render_source_pills(sources)
-                st.markdown(f"**Sources:** {pills_html}", unsafe_allow_html=True)
+
 
             # Show retrieved context in expanders
             if result["context"]:
@@ -528,68 +415,7 @@ def handle_question(config: dict, sidebar_config: dict):
                             unsafe_allow_html=True,
                         )
 
-            # Query security details expander
-            if query_eval and query_eval.get("risk_level", "none") != "none":
-                with st.expander("🛡️ Query Security Details"):
-                    eval_col1, eval_col2 = st.columns(2)
-                    with eval_col1:
-                        risk_emoji = {"low": "🟡", "medium": "🟠", "high": "🔴"}.get(
-                            query_eval.get("risk_level", "none"), "⚪"
-                        )
-                        st.markdown(f"**Risk Level:** {risk_emoji} {query_eval.get('risk_level', 'none').title()}")
-                        st.markdown(f"**Safe:** {'✅ Yes' if query_eval.get('is_safe') else '❌ No'}")
-                    with eval_col2:
-                        st.markdown(f"**Modified:** {'Yes' if query_eval.get('was_modified') else 'No'}")
-                        if query_eval.get("explanation"):
-                            st.markdown(f"**Reason:** {query_eval['explanation']}")
-                    if query_eval.get("flags"):
-                        st.markdown("**Detected patterns:**")
-                        for flag in query_eval["flags"]:
-                            st.markdown(f"- `{flag}`")
 
-            # Retrieval evaluation details
-            retrieval_eval = result.get("retrieval_evaluation", {})
-            if retrieval_eval:
-                attempts = retrieval_eval.get("attempts_made", 0)
-                is_relevant = retrieval_eval.get("is_relevant", True)
-                attempt_log = retrieval_eval.get("attempt_log", [])
-                before = retrieval_eval.get("chunks_before_ranking", 0)
-                after = retrieval_eval.get("chunks_after_ranking", 0)
-
-                if not is_relevant:
-                    st.warning(
-                        f"📊 **Retrieval failed** — Tried {attempts} retrieval "
-                        f"strategies but could not find relevant documents."
-                    )
-                elif attempts > 1:
-                    st.info(
-                        f"🔄 **Retrieval refined** — Found relevant context on "
-                        f"attempt {attempts} of 3."
-                    )
-
-                if before > 0 and after > 0 and before != after:
-                    st.info(
-                        f"🏆 **Chunk ranking** — Retrieved {before} chunks, "
-                        f"selected the top {after} most relevant for context."
-                    )
-
-                if attempt_log:
-                    with st.expander("📊 Retrieval Evaluation Details"):
-                        for entry in attempt_log:
-                            status = "✅" if entry.get("is_relevant") else "❌"
-                            st.markdown(
-                                f"**Attempt {entry.get('attempt', '?')}** — "
-                                f"{entry.get('strategy', 'unknown')} → "
-                                f"{status} {entry.get('chunks_retrieved', 0)} chunks"
-                            )
-                            if entry.get("reason"):
-                                st.caption(f"  ↳ {entry['reason']}")
-                        if before > 0 and after > 0:
-                            st.divider()
-                            st.markdown(
-                                f"**Ranking:** {before} retrieved → "
-                                f"**{after} selected** (top by relevance)"
-                            )
 
         except Exception as exc:
             error_msg = f"Error generating answer: {exc}"
@@ -604,7 +430,7 @@ def handle_question(config: dict, sidebar_config: dict):
 # ─────────────────────────────────────────────────────────────────────
 def main():
     st.set_page_config(
-        page_title="RAG Document Chatbot",
+        page_title="ASK Document",
         page_icon="📚",
         layout="wide",
         initial_sidebar_state="expanded",
@@ -621,7 +447,7 @@ def main():
     # Header
     st.markdown(
         '<div class="main-header">'
-        "<h1>📚 RAG Document Chatbot</h1>"
+        "<h1>📚 ASK Document</h1>"
         "<p>Upload documents · Ask questions · Search the web — all answers grounded in context.</p>"
         "</div>",
         unsafe_allow_html=True,
@@ -648,7 +474,7 @@ def main():
     # Footer
     st.divider()
     st.caption(
-        "RAG Document Chatbot · Powered by LangChain, FAISS, Sentence Transformers & DuckDuckGo · "
+        "ASK Document · Powered by LangChain, FAISS, Sentence Transformers & DuckDuckGo · "
         "Documents are processed locally — only the LLM query is sent to the API."
     )
 
