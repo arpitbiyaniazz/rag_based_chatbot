@@ -51,10 +51,10 @@ EXTRACTORS = {
 
 
 def load_document(file_path: str, extension: str) -> str:
-    """Dispatch to the correct extractor based on file extension."""
+    """Dispatch to the correct extractor based on file extension. Falls back to plain text reading for other types."""
     extractor = EXTRACTORS.get(extension.lower())
     if extractor is None:
-        raise ValueError(f"Unsupported file type: {extension}")
+        return extract_text_from_txt(file_path)
     return extractor(file_path)
 
 
